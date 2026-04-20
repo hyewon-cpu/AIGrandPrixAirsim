@@ -1,0 +1,139 @@
+results_dir: /workspace/depth_estimation/results/run
+encryption_key: tlt_encode
+
+dataset:
+  dataset_name: MonoDataset #StereoDataset, MonoDataset
+  min_depth: 0.001
+  max_depth: 50
+  train_dataset:
+    data_sources:
+      - dataset_name: MetricMonoDataset 
+        data_file: /workspace/depth_estimation/dataforuse/train.txt
+    batch_size: 8
+    workers: 8
+    augmentation:
+      crop_size: [140, 252]
+      input_mean: [0.485, 0.456, 0.406]
+      input_std: [0.229, 0.224, 0.225]
+      min_scale: -0.2
+      max_scale: 0.4
+      do_flip: False
+      yjitter_prob: 1.0
+      color_aug_prob: 0.2
+      color_aug_brightness: 0.4
+      color_aug_contrast: 0.4
+      color_aug_saturation: [0.0, 1.4]
+      eraser_aug_prob: 0.5
+      spatial_aug_prob: 1.0
+      stretch_prob: 0.8
+      h_flip_prob: 0.5
+      v_flip_prob: 0.5
+      hshift_prob: 0.5
+  val_dataset:
+    data_sources:
+      - dataset_name: MetricMonoDataset
+        data_file: /workspace/depth_estimation/dataforuse/val.txt
+    batch_size: 1
+    workers: 4
+    augmentation:
+      crop_size: [140, 252]
+  test_dataset:
+    data_sources:
+      - dataset_name: MetricMonoDataset
+        data_file: /workspace/depth_estimation/dataforuse/test.txt
+    batch_size: 1
+  infer_dataset:
+    data_sources:
+      - dataset_name: MetricMonoDataset
+        data_file: /workspace/depth_estimation/dataforuse/infer.txt
+    batch_size: 10
+
+model:
+  model_type: MetricDepthAnything #FoundationStereo,MetricDepthAnything,RelativeDepthAnything
+  encoder: vitl
+  mono_backbone:
+    pretrained_path: /workspace/depth_estimation/pretrained_model/trainable_relative_depthanythingv2_large_v1.0.pth #pretrained encoder model path 
+    use_bn: False  # whether to use batch normalization. pretrained model이 batch normalization layer를 포함하고 있다면 True로 설정, 그렇지 않으면 False로 설정
+    use_clstoken: False #whether to use class token. 
+
+train:
+  num_gpus: 1 #GPU 개수 
+  gpu_ids: [0] # GPU ID 리스트
+  num_nodes: 1 # 노드 개수(1개 이면 한대의 컴퓨터에서만 학습)
+  num_epochs: 10 #전체 데이터셋을 8번 학습 
+  seed: 1234
+  checkpoint_interval: 1 #interal for checkpoint saving.(epoch 단위)
+  checkpoint_interval_unit: epoch #checkpoint 저장 간격 단위(epoch, step). 매 epoch 마다 저장하려면 epoch, 매 1000 step마다 저장하려면 step
+  validation_interval: 1 #interval for validation(epoch 단위)
+  resume_training_checkpoint_path: null #중간에 끊긴 학습을 이어서 할때 불러올 checkpoint 경로. null이면 새로 학습 시작
+  pretrained_model_path: null #사전 학습된 decoder 경로. null이면 사전 학습된 모델 사용 안함
+  clip_grad_norm: 0.1 #gradient clipping을 사용할 때, gradient의 L2 norm이 0.1보다 크면 0.1로 클리핑
+  dataloader_visualize: True #로그 시각화 
+  vis_step_interval: 100 #100 step 마다 시각화 
+  is_dry_run: False #dry run 모드. True로 설정하면 학습이 제대로 되는지 빠르게 테스트할 수 있음. False로 설정하면 전체 학습 진행
+  precision: fp32 #연산 정밀도 (fp32, fp16, bf16) 
+  distributed_strategy: ddp #distributed data parallel(ddp. 여러 노드에서 데이터를 나눠 병렬 학습할떄 쓰는 방식. gpu 1개쓰면 의미 없음 ), data parallel(dp), single gpu(single)
+  activation_checkpoint: False
+  log_every_n_steps: 100 #100 step 마다 로그 출력 
+  optim:
+    optimizer: AdamW
+    lr: 0.000005 #Initial learning rate for training the model, excluding the backbone
+    momentum: 0.9 #Momentum for the AdamW optimizer
+    weight_decay: 0.0001
+    lr_scheduler: LambdaLR #pytorch 의 LambdaLR 기반 스케줄러 사용. MultiStep,StepLR,CustomMultiStepLRScheduler,LambdaLR,PolynomialLR,OneCycleLR,CosineAnnealingLR
+    lr_steps: [1000] #Steps at which the learning rate must be decreased This is applicable only with the MultiStep LR
+    lr_step_size: 1000 #Number of steps to decrease the learning rate in the StepLR
+    lr_decay: 0.1 #Decreasing factor for the learning rate scheduler
+    min_lr: 1e-07 #Minimum learning rate value for the learning rate scheduler
+    warmup_steps: 20 #Number of steps to perform linear learning rate” warm-up before engaging a learning rate scheduler
+  cudnn:
+    benchmark: False 
+    deterministic: True #reproducible results 위해 True로 설정. False로 설정하면 학습이 더 빨라질 수 있지만 결과가 매번 달라질 수 있음
+
+evaluate:
+  num_gpus: 1
+  gpu_ids: [0]
+  num_nodes: 1
+  checkpoint: /workspace/depth_estimation/results/run/train/dn_model_latest.pth
+  batch_size: -1
+  input_width: 252
+  input_height: 140
+
+inference:
+  num_gpus: 1
+  gpu_ids: [0]
+  num_nodes: 1
+  checkpoint: /workspace/depth_estimation/results/run/train/dn_model_latest.pth
+  batch_size: 8
+  conf_threshold: 0.5
+  input_width: 252
+  input_height: 140
+  save_raw_pfm: False
+
+export:
+  results_dir: /workspace/depth_estimation/results/run/export
+  gpu_id: 0
+  checkpoint: /workspace/depth_estimation/results/run/train/dn_model_latest.pth
+  onnx_file: /workspace/depth_estimation/results/run/export/dn_model_latest.onnx
+  on_cpu: False
+  input_channel: 3
+  input_width: 252
+  input_height: 140
+  opset_version: 16
+  batch_size: -1
+  format: onnx
+  valid_iters: 22
+
+gen_trt_engine:
+  results_dir: /workspace/depth_estimation/results/run/trt
+  gpu_id: 0
+  onnx_file: /workspace/depth_estimation/results/run/export/dn_model_latest.onnx
+  trt_engine: /workspace/depth_estimation/results/run/trt/dn_model.engine
+  timing_cache: null
+  batch_size: -1
+  tensorrt:
+    workspace_size: 1024
+    min_batch_size: 1
+    opt_batch_size: 1
+    max_batch_size: 1
+    data_type: FP32
