@@ -16,7 +16,7 @@ DEFAULT_DEPTH_ONNX_PATH = (
     REPO_ROOT
     / "depth_estimation"
     / "results"
-    / "run_20260420_182306"
+    / "run_20260422_160049"
     / "export"
     / "dn_model_latest.onnx"
 )
@@ -99,6 +99,52 @@ def _resize_depth_image(depth, target_width, target_height):
     return resized[..., 0]
 
 
+def _fit_image_to_size(image: np.ndarray, target_width: int, target_height: int) -> tuple[np.ndarray, str]:
+    """Center-crop or zero-pad an image to the requested size."""
+    src_height, src_width = image.shape[:2]
+    out = image
+    actions: list[str] = []
+
+    if src_width > target_width:
+        left = (src_width - target_width) // 2
+        out = out[:, left : left + target_width]
+        actions.append(f"crop_w({src_width}->{target_width})")
+    if src_height > target_height:
+        top = (src_height - target_height) // 2
+        out = out[top : top + target_height, :]
+        actions.append(f"crop_h({src_height}->{target_height})")
+
+    pad_height = max(0, target_height - out.shape[0])
+    pad_width = max(0, target_width - out.shape[1])
+    if pad_height > 0 or pad_width > 0:
+        pre_pad_h, pre_pad_w = out.shape[:2]
+        pad_top = pad_height // 2
+        pad_bottom = pad_height - pad_top
+        pad_left = pad_width // 2
+        pad_right = pad_width - pad_left
+        out = np.pad(
+            out,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+        pad_parts = []
+        if pad_width > 0:
+            pad_parts.append(f"pad_w({pre_pad_w}->{target_width})")
+        if pad_height > 0:
+            pad_parts.append(f"pad_h({pre_pad_h}->{target_height})")
+        actions.extend(pad_parts)
+
+    if out.shape[0] != target_height or out.shape[1] != target_width:
+        raise ValueError(
+            f"Failed to fit image to {(target_height, target_width)}; got {out.shape[:2]}"
+        )
+
+    if not actions:
+        actions.append("ok")
+    return out, "+".join(actions)
+
+
 class DepthAnythingOnnxEstimator:
     def __init__(
         self,
@@ -142,22 +188,28 @@ class DepthAnythingOnnxEstimator:
             self.runtime = "opencv_dnn"
             self.providers = ["opencv_dnn_cpu"]
 
-    def _preprocess_rgb(self, rgb_image):
+    def _preprocess_bgr(self, rgb_image):
         if rgb_image is None:
             raise ValueError("rgb_image cannot be None")
         if rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
             raise ValueError(
                 f"Expected an RGB image with shape (H, W, 3), got {rgb_image.shape}"
-            )
+        )
 
         rgb = np.asarray(rgb_image)
-        rgb = rgb.astype(np.float32, copy=False) / 255.0
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+        fitted_rgb, action = _fit_image_to_size(rgb, self.input_width, self.input_height)
+        print(
+            f"[depth_input] src={rgb.shape[1]}x{rgb.shape[0]} "
+            f"target={self.input_width}x{self.input_height} action={action}"
+        )
+        rgb = fitted_rgb.astype(np.float32, copy=False) / 255.0
         rgb = (rgb - self.input_mean) / self.input_std
         rgb = np.transpose(rgb, (2, 0, 1))[None, ...]
         return np.ascontiguousarray(rgb, dtype=np.float32)
 
     def predict_depth(self, rgb_image):
-        input_tensor = self._preprocess_rgb(rgb_image)
+        input_tensor = self._preprocess_bgr(rgb_image)
         if self.runtime == "onnxruntime":
             outputs = self.session.run([self.output_name], {self.input_name: input_tensor})
             depth = outputs[0]
@@ -235,7 +287,7 @@ class DiffsimDepthEstimateRacer(DiffSimRacer):
             segmentation_response.height, segmentation_response.width, 3
         )
 
-        return depth, segmentation, rgb_response, segmentation_response
+        return depth, segmentation, rgb, segmentation_response
 
 
 def build_args():
@@ -331,8 +383,15 @@ def build_args():
     )
     parser.add_argument("--debug_print", action="store_true", default=False)
     parser.add_argument("--debug_print_every", type=int, default=10)
+    parser.add_argument("--viz_rgb", dest="viz_rgb", action="store_true", default=False)
     parser.add_argument(
         "--viz_depth", dest="viz_depth", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--viz_depth_raw",
+        dest="viz_depth_raw",
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
         "--viz_segmentation",
@@ -364,7 +423,9 @@ def main():
         depth_input_height=args.depth_input_height,
         depth_device=args.depth_device,
         drone_name=args.drone_name,
+        viz_rgb=args.viz_rgb,
         viz_depth=args.viz_depth,
+        viz_depth_raw=args.viz_depth_raw,
         viz_segmentation=args.viz_segmentation,
         viz_segmentation_map=args.viz_segmentation_map,
         viz_gate_mask=args.viz_gate_mask,

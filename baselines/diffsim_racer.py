@@ -7,45 +7,35 @@ import time
 import airsimdroneracinglab as airsim
 import numpy as np
 
+import cv2 
+import torch 
+from torch import nn
+import torch.nn.functional as F
+
+
 def configure_qt_fontdir():
-    if os.environ.get("QT_QPA_FONTDIR"):
+    if os.environ.get("QT_QPA_FONTDIR"): #if the environment variable QT_QPA_FONTDIR is already set
+        #QT_QPA_FONTDIR : environment variable used by Qt's QPA layer to specify directories for font files. 
         return
-    candidate_dirs = [
+    candidate_dirs = [ #font directories 
         "/usr/share/fonts/truetype/dejavu",
         "/usr/share/fonts/dejavu",
         "/usr/local/share/fonts",
     ]
     for font_dir in candidate_dirs:
-        if os.path.isdir(font_dir):
-            os.environ["QT_QPA_FONTDIR"] = font_dir
+        if os.path.isdir(font_dir): #if direcotiry exists 
+            os.environ["QT_QPA_FONTDIR"] = font_dir #set it as the environment variable's directory 
             return
 
 
 configure_qt_fontdir()
 
-try:
-    import cv2
-except ImportError:  # pragma: no cover
-    cv2 = None
-
-TORCH_IMPORT_ERROR = None
-
-try:
-    import torch
-    from torch import nn
-    import torch.nn.functional as F
-except ImportError as exc:  # pragma: no cover
-    torch = None
-    nn = None
-    F = None
-    TORCH_IMPORT_ERROR = exc
-
 
 def quaternion_to_rotation_matrix(q):
     w, x, y, z = q
-    n = w * w + x * x + y * y + z * z
-    if n < 1e-12:
-        return np.eye(3, dtype=np.float32)
+    n = w * w + x * x + y * y + z * z #sqaured norm 
+    if n < 1e-12: #if norm is too small, it means the quaternion may not represent a valid rotation. 
+        return np.eye(3, dtype=np.float32) #return identity matrix 
     s = 2.0 / n
     wx, wy, wz = s * w * x, s * w * y, s * w * z
     xx, xy, xz = s * x * x, s * x * y, s * x * z
@@ -171,7 +161,9 @@ class DiffSimRacer:
     def __init__(
         self,
         drone_name="drone_1",
+        viz_rgb=False,
         viz_depth=False,
+        viz_depth_raw=False,
         viz_segmentation=False,
         viz_segmentation_map=False,
         viz_gate_mask=False,
@@ -198,7 +190,9 @@ class DiffSimRacer:
         debug_print_every=10,
     ):
         self.drone_name = drone_name
+        self.viz_rgb = viz_rgb
         self.viz_depth = viz_depth
+        self.viz_depth_raw = viz_depth_raw
         self.viz_segmentation = viz_segmentation
         self.viz_segmentation_map = viz_segmentation_map or viz_segmentation
         self.viz_gate_mask = viz_gate_mask or viz_segmentation
@@ -227,6 +221,7 @@ class DiffSimRacer:
         self.last_depth_timestamp = 0.0
         self.last_depth_frame_id = 0
         self.last_control_depth_frame_id = -1
+        self.last_rgb = None
         self.last_segmentation = None
         self.last_segmentation_mask = None
         self.last_segmentation_response = None
@@ -317,8 +312,26 @@ class DiffSimRacer:
             start_position.y_val,
             start_position.z_val - takeoff_height,
         )
+        waypoints = [takeoff_waypoint]
+
+        if self.gate_poses_ground_truth:
+            first_gate_position = self.gate_poses_ground_truth[0].position
+            gate_dx = first_gate_position.x_val - start_position.x_val
+            gate_dy = first_gate_position.y_val - start_position.y_val
+            gate_norm = math.hypot(gate_dx, gate_dy)
+            if gate_norm > 1e-6:
+                # Give the spline a short horizontal segment toward the gate so the
+                # spline tangent points the drone's nose at the gate while rising.
+                face_gate_distance = min(2.0, max(0.75, 0.25 * gate_norm))
+                facing_waypoint = airsim.Vector3r(
+                    start_position.x_val + gate_dx / gate_norm * face_gate_distance,
+                    start_position.y_val + gate_dy / gate_norm * face_gate_distance,
+                    start_position.z_val - takeoff_height,
+                )
+                waypoints = [takeoff_waypoint, facing_waypoint]
+
         self.airsim_client.moveOnSplineAsync(
-            [takeoff_waypoint],
+            waypoints,
             vel_max=5.0,
             acc_max=2.0,
             add_position_constraint=True,
@@ -409,6 +422,15 @@ class DiffSimRacer:
                 compress=False,
             ),
         ]
+        if self.viz_rgb:
+            request.append(
+                airsim.ImageRequest(
+                    "fpv_cam",
+                    airsim.ImageType.Scene,
+                    pixels_as_float=False,
+                    compress=False,
+                )
+            )
         responses = self.airsim_client_images.simGetImages(
             request, vehicle_name=self.drone_name
         )
@@ -432,7 +454,16 @@ class DiffSimRacer:
                 segmentation_response.height, segmentation_response.width, 3
             )
 
-        return depth, segmentation, depth_response, segmentation_response
+        rgb = None
+        if len(responses) > 2:
+            rgb_response = responses[2]
+            if rgb_response.width > 0 and rgb_response.height > 0:
+                rgb = np.frombuffer(
+                    rgb_response.image_data_uint8, dtype=np.uint8
+                ).copy()
+                rgb = rgb.reshape(rgb_response.height, rgb_response.width, 3)
+
+        return depth, segmentation, rgb, segmentation_response
 
     def get_depth_image(self):
         depth, _, _, _ = self.get_sensor_images()
@@ -845,21 +876,52 @@ class DiffSimRacer:
         if torch is None:
             raise ImportError("torch is required to preprocess depth for the model.")
         depth_tensor = torch.as_tensor(depth, dtype=torch.float32)[None, None]
-        depth_tensor = F.interpolate(depth_tensor, (48, 64), mode="nearest")
+        depth_tensor = F.interpolate(depth_tensor, (48, 64), mode="area")
         depth_tensor = F.max_pool2d(depth_tensor, (4, 4))
         return depth_tensor
 
+    def visualize_depth_input(self, depth_tensor):
+        if cv2 is None:
+            return
+        depth_map = depth_tensor.detach().cpu().numpy()[0, 0]
+        depth_map = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
+        depth_map = depth_map.astype(np.uint8)
+        depth_map = cv2.resize(
+            depth_map,
+            (depth_map.shape[1] * 16, depth_map.shape[0] * 16),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        cv2.imshow("depth", depth_map)
+        cv2.waitKey(1)
+
+    def visualize_depth_raw(self, depth):
+        if cv2 is None:
+            return
+        depth = np.clip(depth, 0.0, 50.0)
+        depth_map = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
+        depth_map = depth_map.astype(np.uint8)
+        cv2.imshow("depth_raw", depth_map)
+        cv2.waitKey(1)
+
     def image_callback(self):
-        depth, segmentation, _depth_response, segmentation_response = self.get_sensor_images()
+        depth, segmentation, rgb, segmentation_response = self.get_sensor_images()
         now = time.time()
         if depth is not None:
             self.last_depth = depth
             self.last_depth_timestamp = now
             self.last_depth_frame_id += 1
-            if self.viz_depth and cv2 is not None:
-                depth_viz = np.clip(depth / 25.0 * 255.0, 0, 255).astype(np.uint8)
-                cv2.imshow("depth", depth_viz)
+            if self.viz_depth_raw:
+                self.visualize_depth_raw(depth)
+            if self.viz_depth:
+                depth_input = self.preprocess_depth(depth)
+                self.visualize_depth_input(depth_input)
+        if rgb is not None:
+            self.last_rgb = rgb
+            if self.viz_rgb and cv2 is not None:
+                cv2.imshow("rgb", rgb)
                 cv2.waitKey(1)
+        else:
+            self.last_rgb = None
         if segmentation is not None:
             self.last_segmentation = segmentation
             self.last_segmentation_response = segmentation_response
@@ -1265,6 +1327,10 @@ class DiffSimRacer:
             self.is_control_thread_active = False
             self.control_loop_thread.join()
         if cv2 is not None:
+            if self.viz_rgb:
+                cv2.destroyWindow("rgb")
+            if self.viz_depth_raw:
+                cv2.destroyWindow("depth_raw")
             if self.viz_depth:
                 cv2.destroyWindow("depth")
             if self.viz_segmentation_map:
@@ -1337,8 +1403,15 @@ def main():
     )
     parser.add_argument("--debug_print", action="store_true", default=False)
     parser.add_argument("--debug_print_every", type=int, default=10)
+    parser.add_argument("--viz_rgb", dest="viz_rgb", action="store_true", default=False)
     parser.add_argument(
         "--viz_depth", dest="viz_depth", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--viz_depth_raw",
+        dest="viz_depth_raw",
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
         "--viz_segmentation",
@@ -1362,7 +1435,9 @@ def main():
 
     racer = DiffSimRacer(
         drone_name=args.drone_name,
+        viz_rgb=args.viz_rgb,
         viz_depth=args.viz_depth,
+        viz_depth_raw=args.viz_depth_raw,
         viz_segmentation=args.viz_segmentation,
         viz_segmentation_map=args.viz_segmentation_map,
         viz_gate_mask=args.viz_gate_mask,

@@ -1,0 +1,63 @@
+results_dir: /results/metric_depth_anything/
+dataset:
+  dataset_name: MonoDataset
+  min_depth: 0.001
+  max_depth: 10
+  train_dataset:
+    data_sources:
+      - dataset_name: NYUDV2
+        data_file: /data/splits/nyu_depth_v2_splits/train_files_with_gt.txt
+    batch_size: 8
+    augmentation:
+      crop_size: [518, 518]
+  val_dataset:
+    data_sources:
+      - dataset_name: NYUDV2
+        data_file: /data/splits/nyu_depth_v2_splits/test_files_with_gt.txt
+    batch_size: 1
+    augmentation:
+      crop_size: [518, 518]
+  test_dataset:
+    data_sources:
+      - dataset_name: NYUDV2
+        data_file: /data/splits/nyu_depth_v2_splits/test_files_with_gt.txt
+    batch_size: 1
+  infer_dataset:
+    data_sources:
+      - dataset_name: NYUDV2
+        data_file: /data/splits/nyu_depth_v2_splits/test_files_with_gt.txt
+    batch_size: 10
+train:
+  log_every_n_steps: 100
+  vis_step_interval: 100
+  dataloader_visualize: True
+  num_gpus: 1
+  num_nodes: 1
+  num_epochs: 8
+  activation_checkpoint: False
+  optim:
+    lr: 0.000005
+    lr_scheduler: LambdaLR
+model:
+  model_type: MetricDepthAnything
+  encoder: vitl
+  mono_backbone:
+    pretrained_path: /models/nv_releative_depth_anything_v1.pth
+    use_bn: False
+    use_clstoken: False
+evaluate:
+  num_gpus: 1
+  checkpoint: /results/metric_depth_anything/train/dn_model_latest.pth
+inference:
+  num_gpus: 1
+  checkpoint: /results/metric_depth_anything/train/dn_model_latest.pth
+  save_raw_pfm: False
+export:
+  gpu_id: 0
+  checkpoint: /results/metric_depth_anything/train/dn_model_latest.pth
+  onnx_file: /results/metric_depth_anything/export/dn_model_latest.onnx
+  input_channel: 3
+  input_width: 924
+  input_height: 518
+  opset_version: 16
+  on_cpu: False

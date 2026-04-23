@@ -4,7 +4,7 @@ encryption_key: tlt_encode
 dataset:
   dataset_name: MonoDataset #StereoDataset, MonoDataset
   min_depth: 0.001
-  max_depth: 50
+  max_depth: 200
   train_dataset:
     data_sources:
       - dataset_name: MetricMonoDataset 
@@ -52,20 +52,20 @@ model:
   model_type: MetricDepthAnything #FoundationStereo,MetricDepthAnything,RelativeDepthAnything
   encoder: vitl
   mono_backbone:
-    pretrained_path: /workspace/depth_estimation/pretrained_model/trainable_relative_depthanythingv2_large_v1.0.pth #pretrained encoder model path 
+    pretrained_path: null #pretrained encoder model path 
     use_bn: False  # whether to use batch normalization. pretrained model이 batch normalization layer를 포함하고 있다면 True로 설정, 그렇지 않으면 False로 설정
     use_clstoken: False #whether to use class token. 
 
 train:
   num_gpus: 1 #GPU 개수 
-  gpu_ids: [0] # GPU ID 리스트
+  gpu_ids: [0] # GPU ID 리스트                
   num_nodes: 1 # 노드 개수(1개 이면 한대의 컴퓨터에서만 학습)
-  num_epochs: 10 #전체 데이터셋을 8번 학습 
+  num_epochs: 10 #전체 데이터셋을 20번 학습 
   seed: 1234
   checkpoint_interval: 1 #interal for checkpoint saving.(epoch 단위)
   checkpoint_interval_unit: epoch #checkpoint 저장 간격 단위(epoch, step). 매 epoch 마다 저장하려면 epoch, 매 1000 step마다 저장하려면 step
   validation_interval: 1 #interval for validation(epoch 단위)
-  resume_training_checkpoint_path: null #중간에 끊긴 학습을 이어서 할때 불러올 checkpoint 경로. null이면 새로 학습 시작
+  resume_training_checkpoint_path: /workspace/depth_estimation/results/run_20260422_153134/train/model_epoch_007_step_15904.pth #중간에 끊긴 학습을 이어서 할때 불러올 checkpoint 경로. null이면 새로 학습 시작
   pretrained_model_path: null #사전 학습된 decoder 경로. null이면 사전 학습된 모델 사용 안함
   clip_grad_norm: 0.1 #gradient clipping을 사용할 때, gradient의 L2 norm이 0.1보다 크면 0.1로 클리핑
   dataloader_visualize: True #로그 시각화 

@@ -428,7 +428,7 @@ if __name__ == "__main__":
             "Final_Tier_2",
             "Final_Tier_3",
         ],
-        default="ZhangJiaJie_Medium",
+        default="Soccer_Field_Easy",
     )
     parser.add_argument(
         "--planning_baseline_type",

@@ -114,7 +114,10 @@ class BaselineTier1Collector(BaselineRacer):
         run_name=None,
     ):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        run_name = timestamp
+        if run_name:
+            run_name = sanitize_name(run_name)
+        else:
+            run_name = timestamp
 
         self.run_dir = self.output_root / run_name
         self.run_dir.mkdir(parents=True, exist_ok=False)
@@ -211,8 +214,7 @@ class BaselineTier1Collector(BaselineRacer):
         rgb_path = self.rgb_dir / f"image_{sample_index + 1:03d}.png"
         depth_path = self.depth_dir / f"image_{sample_index + 1:03d}.pfm"
 
-        rgb_bgr = cv2.cvtColor(sample["rgb"], cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(rgb_path), rgb_bgr)
+        cv2.imwrite(str(rgb_path), sample["rgb"])
 
         depth_image = sample["depth"].astype(np.float32, copy=False)
         # AirSim depth can appear vertically inverted when stored directly.
@@ -302,7 +304,7 @@ def build_args():
             "Final_Tier_2",
             "Final_Tier_3",
         ],
-        default="Soccer_Field_Easy",
+        default="Qualifier_Tier_1",
     )
     parser.add_argument("--race_tier", type=int, choices=[1, 2, 3], default=1)
     parser.add_argument("--drone_name", type=str, default="drone_1")
@@ -365,7 +367,7 @@ def main():
             level_name=args.level_name,
             planning_baseline_type=args.planning_baseline_type,
             planning_and_control_api=args.planning_and_control_api,
-            run_name=None,
+            run_name=args.run_name or None,
         )
 
         for game_index in range(args.num_games):
