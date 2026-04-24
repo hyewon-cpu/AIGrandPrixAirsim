@@ -15,3 +15,8 @@ datasets/
 dataforuse/
 results/
 pretrained_model/
+dataforuse_depth/
+datasets_depth/
+corner_inference/
+corner_inference_depth/
+corner_affinity_inference/

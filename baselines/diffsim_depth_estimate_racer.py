@@ -188,16 +188,15 @@ class DepthAnythingOnnxEstimator:
             self.runtime = "opencv_dnn"
             self.providers = ["opencv_dnn_cpu"]
 
-    def _preprocess_bgr(self, rgb_image):
+    def _preprocess_rgb(self, rgb_image):
         if rgb_image is None:
             raise ValueError("rgb_image cannot be None")
         if rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
             raise ValueError(
                 f"Expected an RGB image with shape (H, W, 3), got {rgb_image.shape}"
-        )
+            )
 
         rgb = np.asarray(rgb_image)
-        rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         fitted_rgb, action = _fit_image_to_size(rgb, self.input_width, self.input_height)
         print(
             f"[depth_input] src={rgb.shape[1]}x{rgb.shape[0]} "
@@ -209,7 +208,7 @@ class DepthAnythingOnnxEstimator:
         return np.ascontiguousarray(rgb, dtype=np.float32)
 
     def predict_depth(self, rgb_image):
-        input_tensor = self._preprocess_bgr(rgb_image)
+        input_tensor = self._preprocess_rgb(rgb_image)
         if self.runtime == "onnxruntime":
             outputs = self.session.run([self.output_name], {self.input_name: input_tensor})
             depth = outputs[0]
@@ -235,6 +234,7 @@ class DiffsimDepthEstimateRacer(DiffSimRacer):
         depth_input_width=DEFAULT_DEPTH_INPUT_WIDTH,
         depth_input_height=DEFAULT_DEPTH_INPUT_HEIGHT,
         depth_device=DEFAULT_DEPTH_DEVICE,
+        swap_rb: bool = True,
         **kwargs,
     ):
         self.depth_estimator = DepthAnythingOnnxEstimator(
@@ -243,6 +243,7 @@ class DiffsimDepthEstimateRacer(DiffSimRacer):
             input_height=depth_input_height,
             device=depth_device,
         )
+        self.swap_rb = bool(swap_rb)
         super().__init__(**kwargs)
 
     def get_sensor_images(self):
@@ -278,6 +279,8 @@ class DiffsimDepthEstimateRacer(DiffSimRacer):
 
         rgb = np.frombuffer(rgb_response.image_data_uint8, dtype=np.uint8).copy()
         rgb = rgb.reshape(rgb_response.height, rgb_response.width, 3)
+        if self.swap_rb:
+            rgb = rgb[..., ::-1]
         depth = self.depth_estimator.predict_depth(rgb)
 
         segmentation = np.frombuffer(
@@ -352,6 +355,13 @@ def build_args():
         default=DEFAULT_DEPTH_DEVICE,
         help="Preferred depth backend device: auto, cpu, or cuda.",
     )
+    parser.add_argument(
+        "--no_swap_rb",
+        dest="swap_rb",
+        action="store_false",
+        default=False,
+        help="Do not swap red/blue channels on AirSim Scene frames before inference.",
+    )
     parser.add_argument("--dim_obs", type=int, default=10)
     parser.add_argument("--dim_action", type=int, default=6)
     parser.add_argument("--device", type=str, default="cpu")
@@ -422,6 +432,7 @@ def main():
         depth_input_width=args.depth_input_width,
         depth_input_height=args.depth_input_height,
         depth_device=args.depth_device,
+        swap_rb=args.swap_rb,
         drone_name=args.drone_name,
         viz_rgb=args.viz_rgb,
         viz_depth=args.viz_depth,

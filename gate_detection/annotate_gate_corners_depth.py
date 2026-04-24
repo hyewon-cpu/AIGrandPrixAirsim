@@ -9,8 +9,7 @@ things:
 - the capture input is depth, not RGB, and depth maps are saved as vertically
   flipped PFM files
 
-Corner labels are mirrored top/bottom to match the AirSim camera frame
-convention used here.
+Corner labels match `annotate_gate_corners.py` (TL/TR/BL/BR are not swapped).
 """
 
 from __future__ import annotations
@@ -41,13 +40,9 @@ from annotate_gate_corners import (
 
 
 def flip_corner_label(label: str) -> str:
-    mapping = {
-        "TL": "BL",
-        "BL": "TL",
-        "TR": "BR",
-        "BR": "TR",
-    }
-    return mapping.get(label, label)
+    # Depth frames are saved flipped vertically, but we keep the semantic corner
+    # names (TL/TR/BL/BR) consistent with the RGB annotation script.
+    return label
 
 
 def write_pfm(path: Path, image: np.ndarray) -> None:

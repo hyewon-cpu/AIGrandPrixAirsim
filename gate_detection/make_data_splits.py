@@ -9,7 +9,10 @@ shuffles the combined entries once, and writes:
 - `val.txt` 10%
 - `test.txt` 5%
 
-The output files are written into `gate_detection/dataforuse/` by default.
+By default, the output files are written into:
+
+- `gate_detection/dataforuse/` when `--type rgb`
+- `gate_detection/dataforuse_depth/` when `--type depth`
 """
 
 from __future__ import annotations
@@ -18,10 +21,14 @@ from argparse import ArgumentParser
 from pathlib import Path
 import random
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATASET_ROOT = REPO_ROOT / "gate_detection" / "datasets"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "gate_detection" / "dataforuse"
+RGB_DATASET_ROOT = REPO_ROOT / "gate_detection" / "datasets"
+RGB_OUTPUT_DIR = REPO_ROOT / "gate_detection" / "dataforuse"
+DEPTH_DATASET_ROOT = REPO_ROOT / "gate_detection" / "datasets_depth"
+DEPTH_OUTPUT_DIR = REPO_ROOT / "gate_detection" / "dataforuse_depth"
+
+
+
 
 
 def build_args():
@@ -29,14 +36,14 @@ def build_args():
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default=str(DEFAULT_DATASET_ROOT),
-        help="Folder that contains dataset subfolders, each with a pairs.txt file.",
+        default=None,
+        help="Folder that contains dataset subfolders, each with a pairs.txt file (defaults depend on --type).",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default=str(DEFAULT_OUTPUT_DIR),
-        help="Where to write train.txt, val.txt, and test.txt.",
+        default=None,
+        help="Where to write train.txt, val.txt, and test.txt (defaults depend on --type).",
     )
     parser.add_argument(
         "--datasets",
@@ -49,6 +56,13 @@ def build_args():
         type=int,
         default=1234,
         help="Random seed used before shuffling the combined pairs.",
+    )
+    parser.add_argument(
+        "--type",
+        type=str,
+        default="rgb",
+        choices=["rgb","depth"],
+        help = "whether to use rgb or depth data."
     )
     return parser.parse_args()
 
@@ -113,8 +127,23 @@ def write_split(path: Path, entries: list[str]) -> None:
 
 def main():
     args = build_args()
-    dataset_root = Path(args.dataset_root).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    if args.type == "depth":
+        default_dataset_root = DEPTH_DATASET_ROOT
+        default_output_dir = DEPTH_OUTPUT_DIR
+    else:
+        default_dataset_root = RGB_DATASET_ROOT
+        default_output_dir = RGB_OUTPUT_DIR
+
+    dataset_root = (
+        Path(args.dataset_root).expanduser().resolve()
+        if args.dataset_root
+        else default_dataset_root
+    )
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else default_output_dir
+    )
 
     if not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {dataset_root}")

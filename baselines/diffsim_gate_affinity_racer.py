@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-"""DiffSim racer that uses a corner U-Net to pick the next gate target.
+"""DiffSim racer that uses a corner+PAF U-Net to pick the next gate target.
 
-This is modeled after `diffsim_depth_estimate_racer.py`, but it replaces the
-segmentation-based target selection with a gate-corner detector:
+This is a variant of `diffsim_gate_detection_racer.py`, but uses the paper-style
+gate detector outputs:
 
-- the RGB frame is fed into the corner U-Net
-- the four heatmaps (TL, TR, BL, BR) are converted into corner points
-- those points are averaged into a gate center
-- depth at that center is used to back-project a 3D target point
-- the learned control policy then uses that target point to build target velocity
+- 4 corner confidence maps (TL, TR, BL, BR)
+- 4 Part Affinity Fields (PAFs) for edges:
+  (TL->TR), (TR->BR), (BR->BL), (BL->TL) => 8 channels (vx, vy per edge)
+
+Gate targets are computed from the detected gate center (from corner points) and
+back-projected into 3D using the depth estimate at that pixel.
+
+Post-processing (corner candidates -> edge scoring -> matching -> gate assembly)
+reuses the same helper functions from `gate_detection/train_corner_affinity_detection.py`.
 """
 
 from argparse import ArgumentParser
@@ -24,8 +28,14 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 GATE_DETECTION_DIR = REPO_ROOT / "gate_detection"
-DEFAULT_CORNER_CHECKPOINT = REPO_ROOT / "gate_detection" / "corner_checkpoints" / "best.pt"
-DEFAULT_CORNER_CONF_THRESHOLD = 0.5
+
+DEFAULT_AFFINITY_CHECKPOINT = GATE_DETECTION_DIR / "corner_affinity_checkpoints" / "best.pt"
+DEFAULT_CORNER_CONF_THRESHOLD = 0.25
+DEFAULT_CORNER_TOPK = 50
+DEFAULT_CORNER_NMS_RADIUS = 5
+DEFAULT_EDGE_MIN_SCORE = 0.05
+DEFAULT_INTEGRAL_SAMPLES = 10
+
 DEFAULT_DEPTH_ONNX_PATH = (
     REPO_ROOT
     / "depth_estimation"
@@ -50,17 +60,13 @@ except ImportError:  # pragma: no cover
 
 try:
     import torch
-    import torch.nn as nn
 except ImportError as exc:  # pragma: no cover
     torch = None
-    nn = None
     TORCH_IMPORT_ERROR = exc
 else:
     TORCH_IMPORT_ERROR = None
 
-from diffsim_depth_estimate_racer import (
-    DepthAnythingOnnxEstimator,
-)
+from diffsim_depth_estimate_racer import DepthAnythingOnnxEstimator
 from diffsim_racer import (
     DiffSimRacer,
     DEFAULT_MODEL_PATH,
@@ -72,29 +78,33 @@ from diffsim_racer import (
     quaternion_to_rotation_matrix,
 )
 
+from train_corner_affinity_detection import (  # noqa: E402
+    CORNER_NAMES,
+    EDGE_TYPES,
+    assemble_gates_from_edges,
+    extract_corner_candidates,
+    score_and_match_edges,
+)
 
-class CornerHeatmapEstimator:
-    def __init__(
-        self,
-        checkpoint_path=DEFAULT_CORNER_CHECKPOINT,
-        device="cpu",
-    ):
+
+class CornerAffinityEstimator:
+    def __init__(self, checkpoint_path=DEFAULT_AFFINITY_CHECKPOINT, device="cpu"):
         if torch is None:
             raise ImportError(
-                "torch is required to run the corner detector. "
-                "Install PyTorch in this environment first."
+                "torch is required to run the corner+PAF detector. Install PyTorch first."
             ) from TORCH_IMPORT_ERROR
+
         from corner_unet import CornerUNet
 
         checkpoint_path = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Corner checkpoint does not exist: {checkpoint_path}")
+            raise FileNotFoundError(f"Corner affinity checkpoint does not exist: {checkpoint_path}")
 
         self.checkpoint_path = checkpoint_path
         self.device = torch.device(device)
-        self.model = CornerUNet().to(self.device)
+        self.model = CornerUNet(out_channels=12).to(self.device)
 
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(str(self.checkpoint_path), map_location=self.device)
         if isinstance(checkpoint, dict) and "model" in checkpoint:
             state_dict = checkpoint["model"]
         elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
@@ -124,56 +134,113 @@ class CornerHeatmapEstimator:
         return tensor, (height, width)
 
     @torch.no_grad()
-    def predict_heatmaps(self, rgb_image: np.ndarray) -> np.ndarray:
+    def predict_maps(self, rgb_image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         input_tensor, unpad_hw = self._preprocess_rgb(rgb_image)
         logits = self.model(input_tensor)
-        heatmaps = torch.sigmoid(logits).detach().cpu().numpy()[0]
-        heatmaps = heatmaps.astype(np.float32)
+        corner_maps = torch.sigmoid(logits[:, :4])[0].detach().float().cpu().numpy().astype(np.float32)
+        paf_maps = torch.tanh(logits[:, 4:])[0].detach().float().cpu().numpy().astype(np.float32)
         out_h, out_w = unpad_hw
-        return heatmaps[:, :out_h, :out_w]
+        return corner_maps[:, :out_h, :out_w], paf_maps[:, :out_h, :out_w]
 
 
-class DiffsimGateDetectRacer(DiffSimRacer):
+def _points_to_center_and_size(points: dict[str, tuple[float, float]]) -> tuple[np.ndarray, np.ndarray]:
+    tl = np.array(points["TL"], dtype=np.float32)
+    tr = np.array(points["TR"], dtype=np.float32)
+    br = np.array(points["BR"], dtype=np.float32)
+    bl = np.array(points["BL"], dtype=np.float32)
+    center = (tl + tr + br + bl) / 4.0
+    width_px = float(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
+    height_px = float(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
+    return center.astype(np.float32), np.array([width_px, height_px], dtype=np.float32)
+
+
+class DiffsimGateAffinityRacer(DiffSimRacer):
     def __init__(
         self,
-        corner_model_path=DEFAULT_CORNER_CHECKPOINT,
+        corner_model_path=DEFAULT_AFFINITY_CHECKPOINT,
         corner_conf_threshold=DEFAULT_CORNER_CONF_THRESHOLD,
+        corner_topk=DEFAULT_CORNER_TOPK,
+        corner_nms_radius=DEFAULT_CORNER_NMS_RADIUS,
+        edge_min_score=DEFAULT_EDGE_MIN_SCORE,
+        integral_samples=DEFAULT_INTEGRAL_SAMPLES,
         viz_corner_heatmaps: bool = False,
         viz_corner_stride: int = 1,
-        swap_rb: bool = True,
+        swap_rb: bool = False,
         depth_onnx_path=DEFAULT_DEPTH_ONNX_PATH,
         depth_input_width=DEFAULT_DEPTH_INPUT_WIDTH,
         depth_input_height=DEFAULT_DEPTH_INPUT_HEIGHT,
         depth_device=DEFAULT_DEPTH_DEVICE,
         **kwargs,
     ):
-        self.corner_estimator = CornerHeatmapEstimator(
+        self.corner_estimator = CornerAffinityEstimator(
             checkpoint_path=corner_model_path,
             device=kwargs.get("device", "cpu"),
         )
         self.corner_conf_threshold = float(corner_conf_threshold)
+        self.corner_topk = int(corner_topk)
+        self.corner_nms_radius = int(corner_nms_radius)
+        self.edge_min_score = float(edge_min_score)
+        self.integral_samples = int(integral_samples)
+        self.swap_rb = bool(swap_rb)
+
         self.viz_corner_heatmaps = bool(viz_corner_heatmaps)
         self.viz_corner_stride = max(1, int(viz_corner_stride))
         self._viz_corner_counter = 0
         self._warned_missing_cv2_heatmaps = False
-        self.swap_rb = bool(swap_rb)
+        self._warned_corner_overlay_error = False
+        self._gate_postproc_debug_counter = 0
+
         self.last_rgb_response = None
         self.last_corner_target_airsim = None
         self.last_corner_backup_target_airsim = None
         self.last_corner_candidate_targets_airsim = []
         self.last_corner_gate_candidates = []
         self.last_corner_candidate_timestamp = 0.0
+
         self.depth_estimator = DepthAnythingOnnxEstimator(
             onnx_path=depth_onnx_path,
             input_width=depth_input_width,
             input_height=depth_input_height,
             device=depth_device,
         )
-        # Allow callers/CLI to override target_source (e.g. ground_truth).
+
         kwargs.setdefault("target_source", "corner_detection")
         super().__init__(**kwargs)
 
+    def image_callback(self):
+        # Keep the base depth/rgb update logic intact.
+        super().image_callback()
+
+        # Visualize detector output even when flying on ground-truth targets.
+        # Also makes visualization independent of the control thread.
+        if not self.viz_corner_heatmaps or cv2 is None:
+            return
+        if self.last_rgb is None or self.last_rgb_response is None:
+            return
+
+        self._viz_corner_counter += 1
+        if (self._viz_corner_counter - 1) % self.viz_corner_stride != 0:
+            return
+
+        try:
+            corner_maps, paf_maps = self.corner_estimator.predict_maps(self.last_rgb)
+            gate_candidates = self._extract_gate_candidates(
+                corner_maps,
+                paf_maps,
+                int(self.last_rgb_response.width),
+                int(self.last_rgb_response.height),
+                max_gates=5,
+            )
+            self.last_corner_gate_candidates = gate_candidates
+            self._viz_corner_overlay(self.last_rgb, gate_candidates)
+        except Exception as exc:
+            if self.debug_print and not self._warned_corner_overlay_error:
+                print(f"[corner_overlay] overlay inference failed: {exc}")
+                self._warned_corner_overlay_error = True
+            return
+
     def _viz_corner_overlay(self, rgb_image: np.ndarray, gate_candidates: list[dict]) -> None:
+        # Keep visualization consistent with `gate_detection/test_corner_affinitiy_detector.py`.
         if not self.viz_corner_heatmaps:
             return
         if cv2 is None:
@@ -181,17 +248,11 @@ class DiffsimGateDetectRacer(DiffSimRacer):
                 print("[corner_overlay] OpenCV (cv2) not available; cannot visualize overlays.")
                 self._warned_missing_cv2_heatmaps = True
             return
-        if rgb_image is None:
-            return
-        if rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
+        if rgb_image is None or rgb_image.ndim != 3 or rgb_image.shape[2] != 3:
             return
 
-        self._viz_corner_counter += 1
-        if (self._viz_corner_counter - 1) % self.viz_corner_stride != 0:
-            return
+        display_bgr = rgb_image.copy()
 
-        overlay = rgb_image.copy()
-        height, width = overlay.shape[:2]
         palette = [
             (0, 0, 255),
             (0, 165, 255),
@@ -199,222 +260,113 @@ class DiffsimGateDetectRacer(DiffSimRacer):
             (0, 255, 0),
             (255, 0, 0),
         ]
-
-        for gate_idx, gate_candidate in enumerate(gate_candidates[:5]):
+        for gate_idx, gate in enumerate(gate_candidates[:5]):
             color = palette[gate_idx % len(palette)]
-            points = gate_candidate.get("points", {})
-            center = gate_candidate.get("center")
-
-            if center is not None:
-                cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
-                cv2.circle(overlay, (cx, cy), 5, color, -1)
+            pts = gate.get("points", {})
+            for name, point in pts.items():
+                x, y = float(point[0]), float(point[1])
+                cv2.circle(display_bgr, (int(round(x)), int(round(y))), 4, color, -1)
                 cv2.putText(
-                    overlay,
-                    f"G{gate_idx + 1}:{gate_candidate.get('gate_score', 0.0):.2f}",
-                    (cx + 6, cy - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
-
-            for name, point in points.items():
-                px, py = int(round(float(point[0]))), int(round(float(point[1])))
-                cv2.circle(overlay, (px, py), 4, color, -1)
-                cv2.putText(
-                    overlay,
+                    display_bgr,
                     name,
-                    (px + 4, py - 4),
+                    (int(round(x)) + 4, int(round(y)) - 4),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.4,
                     (255, 255, 255),
                     1,
                     cv2.LINE_AA,
                 )
+            for a, b in EDGE_TYPES:
+                if a in pts and b in pts:
+                    x0, y0 = float(pts[a][0]), float(pts[a][1])
+                    x1, y1 = float(pts[b][0]), float(pts[b][1])
+                    cv2.line(
+                        display_bgr,
+                        (int(round(x0)), int(round(y0))),
+                        (int(round(x1)), int(round(y1))),
+                        color,
+                        1,
+                    )
 
         cv2.putText(
-            overlay,
-            f"gate_candidates={len(gate_candidates)}",
-            (8, max(22, height - 10)),
+            display_bgr,
+            f"gates={len(gate_candidates)} thr={self.corner_conf_threshold:.2f} topk={self.corner_topk} nms={self.corner_nms_radius}",
+            (8, 22),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
-        # OpenCV expects BGR; our pipeline uses RGB for model inputs.
-        cv2.imshow("corner_overlay", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        cv2.imshow("corner_affinity_detector_overlay", display_bgr)
         cv2.waitKey(1)
-
-    def _find_heatmap_peaks(
-        self,
-        heatmap: np.ndarray,
-        max_peaks: int = 4,
-        min_distance: int = 6,
-        threshold: float | None = None,
-    ) -> list[dict]:
-        if heatmap.ndim != 2:
-            return []
-
-        work = heatmap.astype(np.float32, copy=True)
-        threshold = self.corner_conf_threshold if threshold is None else float(threshold)
-        peaks: list[dict] = []
-        suppression = max(1, int(min_distance))
-
-        for _ in range(max_peaks):
-            flat_index = int(np.argmax(work))
-            score = float(work.flat[flat_index])
-            if not np.isfinite(score) or score < threshold:
-                break
-            y_idx, x_idx = np.unravel_index(flat_index, work.shape)
-            peaks.append(
-                {
-                    "x_idx": int(x_idx),
-                    "y_idx": int(y_idx),
-                    "score": score,
-                }
-            )
-
-            x0 = max(0, x_idx - suppression)
-            x1 = min(work.shape[1], x_idx + suppression + 1)
-            y0 = max(0, y_idx - suppression)
-            y1 = min(work.shape[0], y_idx + suppression + 1)
-            work[y0:y1, x0:x1] = -np.inf
-
-        return peaks
 
     def _extract_gate_candidates(
         self,
-        heatmaps: np.ndarray,
+        corner_maps: np.ndarray,
+        paf_maps: np.ndarray,
         image_width: int,
         image_height: int,
-        max_peaks_per_corner: int = 4,
         max_gates: int = 5,
     ) -> list[dict]:
-        if heatmaps.ndim != 3 or heatmaps.shape[0] != 4:
+        if corner_maps.ndim != 3 or corner_maps.shape[0] != 4:
+            return []
+        if paf_maps.ndim != 3 or paf_maps.shape[0] != 8:
             return []
 
-        hmap_h, hmap_w = heatmaps.shape[1], heatmaps.shape[2]
-        corner_names = ("TL", "TR", "BL", "BR")
-        corner_candidates: dict[str, list[dict]] = {}
-        for idx, name in enumerate(corner_names):
-            peaks = self._find_heatmap_peaks(
-                heatmaps[idx],
-                max_peaks=max_peaks_per_corner,
-                min_distance=max(4, min(hmap_h, hmap_w) // 20),
-            )
-            candidates = []
-            for peak in peaks:
-                x = (float(peak["x_idx"]) + 0.5) * float(image_width) / float(hmap_w)
-                y = (float(peak["y_idx"]) + 0.5) * float(image_height) / float(hmap_h)
-                candidates.append(
-                    {
-                        "label": name,
-                        "point": np.array([x, y], dtype=np.float32),
-                        "score": float(peak["score"]),
-                        "pixel": np.array([x, y], dtype=np.float32),
-                    }
-                )
-            corner_candidates[name] = candidates
-
-        if any(not corner_candidates[name] for name in corner_names):
+        candidates = extract_corner_candidates(
+            corner_maps,
+            threshold=self.corner_conf_threshold,
+            topk=self.corner_topk,
+            nms_radius=self.corner_nms_radius,
+        )
+        if any(len(candidates[name]) == 0 for name in CORNER_NAMES):
             return []
 
-        depth_map = self.last_depth if isinstance(self.last_depth, np.ndarray) else None
-        source_size = (int(image_height), int(image_width))
+        edge_matches = score_and_match_edges(
+            candidates,
+            paf_maps,
+            edge_min_score=self.edge_min_score,
+            integral_samples=self.integral_samples,
+        )
+        raw_gates = assemble_gates_from_edges(edge_matches)
+        if not raw_gates:
+            return []
+
+        if self.debug_print:
+            self._gate_postproc_debug_counter += 1
+            if (self._gate_postproc_debug_counter - 1) % self.debug_print_every == 0:
+                cand_counts = {k: len(v) for k, v in candidates.items()}
+                match_counts = {f"{a}_{b}": len(edge_matches.get((a, b), [])) for a, b in EDGE_TYPES}
+                print("[gate_postproc]", "candidates=", cand_counts, "edge_matches=", match_counts, "raw_gates=", len(raw_gates))
 
         gate_candidates: list[dict] = []
-        for tl in corner_candidates["TL"]:
-            for tr in corner_candidates["TR"]:
-                for bl in corner_candidates["BL"]:
-                    for br in corner_candidates["BR"]:
-                        points = {
-                            "TL": tl["point"],
-                            "TR": tr["point"],
-                            "BL": bl["point"],
-                            "BR": br["point"],
-                        }
-                        scores = {
-                            "TL": float(tl["score"]),
-                            "TR": float(tr["score"]),
-                            "BL": float(bl["score"]),
-                            "BR": float(br["score"]),
-                        }
-
-                        xs = np.array([points[name][0] for name in corner_names], dtype=np.float32)
-                        ys = np.array([points[name][1] for name in corner_names], dtype=np.float32)
-                        if not (xs[0] < xs[1] and xs[2] < xs[3] and ys[0] < ys[2] and ys[1] < ys[3]):
-                            continue
-
-                        tl_pt = points["TL"]
-                        tr_pt = points["TR"]
-                        bl_pt = points["BL"]
-                        br_pt = points["BR"]
-                        center = (tl_pt + tr_pt + bl_pt + br_pt) / 4.0
-                        width_px = 0.5 * (np.linalg.norm(tr_pt - tl_pt) + np.linalg.norm(br_pt - bl_pt))
-                        height_px = 0.5 * (np.linalg.norm(bl_pt - tl_pt) + np.linalg.norm(br_pt - tr_pt))
-                        if width_px < 1.0 or height_px < 1.0:
-                            continue
-
-                        depth_samples = {}
-                        finite_depths = []
-                        if depth_map is not None:
-                            for name in corner_names:
-                                depth_value = self._sample_depth_at_pixel(
-                                    depth_map,
-                                    points[name],
-                                    source_size,
-                                )
-                                depth_samples[name] = depth_value
-                                if np.isfinite(depth_value):
-                                    finite_depths.append(depth_value)
-
-                        if depth_map is not None and len(finite_depths) < 4:
-                            continue
-
-                        depth_mean = float(np.mean(finite_depths)) if finite_depths else np.inf
-                        depth_std = float(np.std(finite_depths)) if finite_depths else np.inf
-                        if np.isfinite(depth_std) and depth_mean > 1e-6:
-                            depth_consistency = 1.0 / (1.0 + depth_std / depth_mean)
-                        else:
-                            depth_consistency = 0.0
-
-                        rect_aspect = width_px / max(height_px, 1e-6)
-                        rect_shape_penalty = abs(math.log(max(rect_aspect, 1e-6)))
-                        geom_score = 1.0 / (1.0 + rect_shape_penalty)
-                        heatmap_score = float(np.mean(list(scores.values())))
-                        gate_score = heatmap_score * (0.6 + 0.4 * depth_consistency) * geom_score
-                        if np.isfinite(depth_mean):
-                            gate_score /= (1.0 + 0.02 * depth_mean)
-
-                        gate_candidates.append(
-                            {
-                                "points": points,
-                                "scores": scores,
-                                "center": center.astype(np.float32),
-                                "size": np.array([width_px, height_px], dtype=np.float32),
-                                "confidence": heatmap_score,
-                                "depth_samples": depth_samples,
-                                "depth_mean": depth_mean,
-                                "depth_std": depth_std,
-                                "gate_score": float(gate_score),
-                            }
-                        )
-
-        gate_candidates.sort(key=lambda item: item["gate_score"], reverse=True)
-
-        selected: list[dict] = []
-        min_center_sep = 0.35 * float(min(image_width, image_height))
-        for candidate in gate_candidates:
-            if len(selected) >= max_gates:
-                break
-            center = candidate["center"]
-            if any(np.linalg.norm(center - other["center"]) < min_center_sep for other in selected):
+        for gate in raw_gates:
+            points = gate.get("points", {})
+            if not all(k in points for k in CORNER_NAMES):
                 continue
-            selected.append(candidate)
 
-        return selected
+            center, size = _points_to_center_and_size(points)
+
+            scores = gate.get("scores", {})
+            heatmap_score = float(np.mean([float(scores.get(k, 0.0)) for k in CORNER_NAMES]))
+            gate_score = float(gate.get("gate_score", heatmap_score))
+
+            gate_candidates.append(
+                {
+                    "points": {k: np.array(points[k], dtype=np.float32) for k in CORNER_NAMES},
+                    "scores": {k: float(scores.get(k, 0.0)) for k in CORNER_NAMES},
+                    "edge_scores": gate.get("edge_scores", {}),
+                    "center": center,
+                    "size": size,
+                    "confidence": heatmap_score,
+                    "gate_score": gate_score,
+                }
+            )
+
+        gate_candidates.sort(key=lambda g: float(g.get("gate_score", 0.0)), reverse=True)
+
+        return gate_candidates[: int(max_gates)]
 
     def get_sensor_images(self):
         responses = self.airsim_client_images.simGetImages(
@@ -439,6 +391,7 @@ class DiffsimGateDetectRacer(DiffSimRacer):
         rgb = rgb.reshape(rgb_response.height, rgb_response.width, 3)
         if self.swap_rb:
             rgb = rgb[..., ::-1]
+
         depth = self.depth_estimator.predict_depth(rgb)
         self.last_rgb_response = rgb_response
         return depth, None, rgb, None
@@ -468,13 +421,7 @@ class DiffsimGateDetectRacer(DiffSimRacer):
             return np.inf
         return float(np.median(patch))
 
-    def _gate_target_to_airsim(
-        self,
-        candidate,
-        intr,
-        rgb_response,
-        gate_dimensions=None,
-    ):
+    def _gate_target_to_airsim(self, candidate, intr, rgb_response, gate_dimensions=None):
         if candidate is None:
             return None, np.inf, "unavailable"
 
@@ -542,16 +489,30 @@ class DiffsimGateDetectRacer(DiffSimRacer):
                 }
             return None, {}
 
-        heatmaps = self.corner_estimator.predict_heatmaps(self.last_rgb)
+        corner_maps, paf_maps = self.corner_estimator.predict_maps(self.last_rgb)
         gate_candidates = self._extract_gate_candidates(
-            heatmaps,
+            corner_maps,
+            paf_maps,
             int(self.last_rgb_response.width),
             int(self.last_rgb_response.height),
         )
         self.last_corner_gate_candidates = gate_candidates
         self.last_corner_candidate_targets_airsim = []
-        self._viz_corner_overlay(self.last_rgb, gate_candidates)
         if not gate_candidates:
+            # If the detector loses the gate temporarily, keep flying toward the last target
+            # instead of switching to the forward-fallback target_v.
+            if self.last_corner_target_airsim is not None:
+                return self.last_corner_target_airsim, {
+                    "segmentation_depth_source": "cached_primary",
+                    "segmentation_target_cache_used": True,
+                    "segmentation_target_cache_rank": 1,
+                }
+            if self.last_corner_backup_target_airsim is not None:
+                return self.last_corner_backup_target_airsim, {
+                    "segmentation_depth_source": "cached_secondary",
+                    "segmentation_target_cache_used": True,
+                    "segmentation_target_cache_rank": 2,
+                }
             return None, {}
 
         intr = self.get_camera_intrinsics(
@@ -559,11 +520,13 @@ class DiffsimGateDetectRacer(DiffSimRacer):
             int(self.last_rgb_response.height),
         )
         gate_dimensions = self.get_active_gate_dimensions()
+
         candidate_targets = []
         p_target_airsim = None
         depth_m = np.inf
         depth_source = "unavailable"
         candidate = None
+
         for gate_candidate in gate_candidates:
             target_airsim, target_depth_m, target_depth_source = self._gate_target_to_airsim(
                 gate_candidate,
@@ -613,7 +576,7 @@ class DiffsimGateDetectRacer(DiffSimRacer):
             "segmentation_backup_depth_source": depth_source,
             "segmentation_backup_rank": 1,
             "segmentation_blob_count": 1,
-            "segmentation_blob_selection": "corner_heatmaps",
+            "segmentation_blob_selection": "corner_affinity",
             "segmentation_blob_depth_m": depth_m,
             "segmentation_promoted": False,
             "segmentation_promote_depth_threshold": self.corner_conf_threshold,
@@ -633,6 +596,7 @@ class DiffsimGateDetectRacer(DiffSimRacer):
         return p_target_airsim, aux
 
     def build_state_tensor(self, state_dict):
+        # Same control/target logic pattern as `diffsim_gate_detection_racer.py`.
         if torch is None:
             raise ImportError("torch is required to build model inputs.")
 
@@ -711,7 +675,7 @@ class DiffsimGateDetectRacer(DiffSimRacer):
 
 
 def build_args():
-    parser = ArgumentParser(description="Run the DiffSim racer using gate-corner detection.")
+    parser = ArgumentParser(description="Run the DiffSim racer using corner+PAF (affinity) gate detection.")
     parser.add_argument(
         "--level_name",
         type=str,
@@ -745,22 +709,15 @@ def build_args():
     parser.add_argument(
         "--corner_model_path",
         type=str,
-        default=str(DEFAULT_CORNER_CHECKPOINT),
-        help="Path to the trained corner heatmap checkpoint.",
+        default=str(DEFAULT_AFFINITY_CHECKPOINT),
+        help="Path to the trained corner+PAF checkpoint.",
     )
-    parser.add_argument(
-        "--corner_conf_threshold",
-        type=float,
-        default=DEFAULT_CORNER_CONF_THRESHOLD,
-        help="Minimum heatmap confidence for each detected corner.",
-    )
-    parser.add_argument(
-        "--no_swap_rb",
-        dest="swap_rb",
-        action="store_false",
-        default=True,
-        help="Do not swap red/blue channels on AirSim Scene frames before inference.",
-    )
+    parser.add_argument("--corner_conf_threshold", type=float, default=DEFAULT_CORNER_CONF_THRESHOLD)
+    parser.add_argument("--corner_topk", type=int, default=DEFAULT_CORNER_TOPK)
+    parser.add_argument("--corner_nms_radius", type=int, default=DEFAULT_CORNER_NMS_RADIUS)
+    parser.add_argument("--edge_min_score", type=float, default=DEFAULT_EDGE_MIN_SCORE)
+    parser.add_argument("--integral_samples", type=int, default=DEFAULT_INTEGRAL_SAMPLES)
+    parser.add_argument("--swap_rb", action="store_true", default=True, help="Swap red/blue channels on AirSim Scene frames before inference (use if colors look wrong).",)
     parser.add_argument(
         "--depth_onnx_path",
         "--depth_checkpoint",
@@ -769,24 +726,9 @@ def build_args():
         default=str(DEFAULT_DEPTH_ONNX_PATH),
         help="Path to the RGB-to-depth ONNX model.",
     )
-    parser.add_argument(
-        "--depth_input_width",
-        type=int,
-        default=DEFAULT_DEPTH_INPUT_WIDTH,
-        help="Input width used for ONNX depth inference.",
-    )
-    parser.add_argument(
-        "--depth_input_height",
-        type=int,
-        default=DEFAULT_DEPTH_INPUT_HEIGHT,
-        help="Input height used for ONNX depth inference.",
-    )
-    parser.add_argument(
-        "--depth_device",
-        type=str,
-        default=DEFAULT_DEPTH_DEVICE,
-        help="Preferred depth backend device: auto, cpu, or cuda.",
-    )
+    parser.add_argument("--depth_input_width", type=int, default=DEFAULT_DEPTH_INPUT_WIDTH)
+    parser.add_argument("--depth_input_height", type=int, default=DEFAULT_DEPTH_INPUT_HEIGHT)
+    parser.add_argument("--depth_device", type=str, default=DEFAULT_DEPTH_DEVICE)
     parser.add_argument("--dim_obs", type=int, default=10)
     parser.add_argument("--dim_action", type=int, default=6)
     parser.add_argument("--device", type=str, default="cpu")
@@ -810,24 +752,23 @@ def build_args():
     parser.add_argument("--viz_depth", dest="viz_depth", action="store_true", default=False)
     parser.add_argument("--viz_depth_raw", dest="viz_depth_raw", action="store_true", default=False)
     parser.add_argument("--viz_corner_heatmaps", action="store_true", default=False)
-    parser.add_argument(
-        "--viz_corner_stride",
-        type=int,
-        default=1,
-        help="Show corner overlay every N frames (reduces UI overhead).",
-    )
+    parser.add_argument("--viz_corner_stride", type=int, default=1)
     return parser.parse_args()
 
 
 def main():
     args = build_args()
 
-    racer = DiffsimGateDetectRacer(
+    racer = DiffsimGateAffinityRacer(
         corner_model_path=args.corner_model_path,
         corner_conf_threshold=args.corner_conf_threshold,
-        swap_rb=args.swap_rb,
+        corner_topk=args.corner_topk,
+        corner_nms_radius=args.corner_nms_radius,
+        edge_min_score=args.edge_min_score,
+        integral_samples=args.integral_samples,
         viz_corner_heatmaps=args.viz_corner_heatmaps,
         viz_corner_stride=args.viz_corner_stride,
+        swap_rb=args.swap_rb,
         depth_onnx_path=args.depth_onnx_path,
         depth_input_width=args.depth_input_width,
         depth_input_height=args.depth_input_height,
