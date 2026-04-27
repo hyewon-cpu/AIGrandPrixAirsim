@@ -267,7 +267,8 @@ class CornerDetectorVizRacer(BaselineRacer):
                 2,
                 cv2.LINE_AA,
             )
-        cv2.imshow("corner_detector_overlay", display_bgr)
+        display_viz = display_bgr[..., ::-1] if self.swap_rb else display_bgr
+        cv2.imshow("corner_detector_overlay", display_viz)
         key = int(cv2.waitKey(1) & 0xFF)
         if key in (ord("q"), 27):  # q or ESC
             self.is_image_thread_active = False

@@ -451,8 +451,22 @@ class DiffsimGateDetectRacer(DiffSimRacer):
 
         src_h, src_w = source_size
         depth_h, depth_w = depth.shape[:2]
-        x = float(pixel[0]) * float(depth_w) / float(src_w)
-        y = float(pixel[1]) * float(depth_h) / float(src_h)
+        # Map from RGB pixel coordinates into the depth-map pixel coordinates by
+        # reversing the crop/pad performed by the depth estimator input fitting
+        # (see `_fit_image_to_size` in `diffsim_depth_estimate_racer.py`).
+        x_src = float(pixel[0])
+        y_src = float(pixel[1])
+
+        crop_left = (int(src_w) - int(depth_w)) // 2 if src_w > depth_w else 0
+        crop_top = (int(src_h) - int(depth_h)) // 2 if src_h > depth_h else 0
+        cropped_w = int(depth_w) if src_w > depth_w else int(src_w)
+        cropped_h = int(depth_h) if src_h > depth_h else int(src_h)
+
+        pad_left = (int(depth_w) - int(cropped_w)) // 2 if cropped_w < depth_w else 0
+        pad_top = (int(depth_h) - int(cropped_h)) // 2 if cropped_h < depth_h else 0
+
+        x = (x_src - float(crop_left)) if src_w > depth_w else (x_src + float(pad_left))
+        y = (y_src - float(crop_top)) if src_h > depth_h else (y_src + float(pad_top))
         xi = int(round(x))
         yi = int(round(y))
         if xi < 0 or yi < 0 or xi >= depth_w or yi >= depth_h:

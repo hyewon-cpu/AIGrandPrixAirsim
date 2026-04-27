@@ -170,6 +170,10 @@ class DiffSimRacer:
         control_mode="velocity",
         control_period=0.05,
         image_period=0.05,
+        sync_control_to_depth: bool = False,
+        sync_depth_timeout_sec: float = 0.5,
+        sync_viz_to_control: bool = False,
+        sync_viz_timeout_sec: float = 0.05,
         hover_throttle=1.0,
         target_speed=7.0,
         model_path=None,
@@ -199,6 +203,10 @@ class DiffSimRacer:
         self.control_mode = control_mode
         self.control_period = control_period
         self.image_period = image_period
+        self.sync_control_to_depth = bool(sync_control_to_depth)
+        self.sync_depth_timeout_sec = float(sync_depth_timeout_sec)
+        self.sync_viz_to_control = bool(sync_viz_to_control)
+        self.sync_viz_timeout_sec = float(sync_viz_timeout_sec)
         self.hover_throttle = hover_throttle
         self.target_speed = target_speed
         self.gravity = 9.81
@@ -221,6 +229,8 @@ class DiffSimRacer:
         self.last_depth_timestamp = 0.0
         self.last_depth_frame_id = 0
         self.last_control_depth_frame_id = -1
+        self._depth_fps_last_time = None
+        self._depth_fps_last_frame_id = 0
         self.last_rgb = None
         self.last_segmentation = None
         self.last_segmentation_mask = None
@@ -236,6 +246,10 @@ class DiffSimRacer:
         self.current_forward = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         self.is_image_thread_active = False
         self.is_control_thread_active = False
+        self._sensor_cond = threading.Condition() #creates condition object that has methods like : notify_all(), notify(), wait() 
+        self._viz_overlay_cond = threading.Condition()
+        self._viz_overlay_by_frame_id: dict[int, dict] = {}
+        self._viz_overlay_active: dict | None = None
         self.level_name = None
         self.gate_poses_ground_truth = []
         self.gate_names_ground_truth = []
@@ -307,28 +321,26 @@ class DiffSimRacer:
         start_position = self.airsim_client.simGetVehiclePose(
             vehicle_name=self.drone_name
         ).position #current position at that moment 
+
+        if not self.gate_poses_ground_truth:
+            try:
+                self.get_ground_truth_gate_poses()
+            except Exception:
+                pass
+        if self.debug_print:
+            print(
+                "[takeoff]",
+                "gate_poses_loaded=",
+                bool(self.gate_poses_ground_truth),
+                "gate_count=",
+                0 if not self.gate_poses_ground_truth else len(self.gate_poses_ground_truth),
+            )
         takeoff_waypoint = airsim.Vector3r(
             start_position.x_val,
             start_position.y_val,
             start_position.z_val - takeoff_height,
         )
         waypoints = [takeoff_waypoint]
-
-        if self.gate_poses_ground_truth:
-            first_gate_position = self.gate_poses_ground_truth[0].position
-            gate_dx = first_gate_position.x_val - start_position.x_val
-            gate_dy = first_gate_position.y_val - start_position.y_val
-            gate_norm = math.hypot(gate_dx, gate_dy)
-            if gate_norm > 1e-6:
-                # Give the spline a short horizontal segment toward the gate so the
-                # spline tangent points the drone's nose at the gate while rising.
-                face_gate_distance = min(2.0, max(0.75, 0.25 * gate_norm))
-                facing_waypoint = airsim.Vector3r(
-                    start_position.x_val + gate_dx / gate_norm * face_gate_distance,
-                    start_position.y_val + gate_dy / gate_norm * face_gate_distance,
-                    start_position.z_val - takeoff_height,
-                )
-                waypoints = [takeoff_waypoint, facing_waypoint]
 
         self.airsim_client.moveOnSplineAsync(
             waypoints,
@@ -891,6 +903,7 @@ class DiffSimRacer:
             (depth_map.shape[1] * 16, depth_map.shape[0] * 16),
             interpolation=cv2.INTER_NEAREST,
         )
+        depth_map = self.augment_depth_input_viz(depth_map)
         cv2.imshow("depth", depth_map)
         cv2.waitKey(1)
 
@@ -900,33 +913,106 @@ class DiffSimRacer:
         depth = np.clip(depth, 0.0, 50.0)
         depth_map = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
         depth_map = depth_map.astype(np.uint8)
+        depth_map = self.augment_depth_raw_viz(depth_map)
         cv2.imshow("depth_raw", depth_map)
         cv2.waitKey(1)
+
+    def build_viz_overlay(self, aux: dict, frame_id: int) -> dict | None: #build the overlay data from control thread 
+        return None
+
+    def _put_viz_overlay(self, frame_id: int, overlay: dict) -> None: #put the overlay data into frame ids 
+        with self._viz_overlay_cond:
+            self._viz_overlay_by_frame_id[int(frame_id)] = overlay
+            if len(self._viz_overlay_by_frame_id) > 20:
+                for key in sorted(self._viz_overlay_by_frame_id.keys())[:-10]:
+                    self._viz_overlay_by_frame_id.pop(key, None)
+            self._viz_overlay_cond.notify_all()
+
+    def _get_viz_overlay(self, frame_id: int, wait: bool) -> dict | None: #get the overlay data from certain frame id 
+        with self._viz_overlay_cond:
+            if not wait:
+                # Best-effort: if the exact overlay for this frame_id isn't ready yet,
+                # fall back to the most recent overlay so visualization stays responsive
+                # when sync_viz_to_control is disabled.
+                overlay = self._viz_overlay_by_frame_id.get(int(frame_id))
+                if overlay is not None:
+                    return overlay
+                if not self._viz_overlay_by_frame_id:
+                    return None
+                latest_frame_id = max(self._viz_overlay_by_frame_id.keys())
+                return self._viz_overlay_by_frame_id.get(int(latest_frame_id))
+            deadline = time.time() + max(0.0, float(self.sync_viz_timeout_sec))
+            while int(frame_id) not in self._viz_overlay_by_frame_id:
+                remaining = deadline - time.time()
+                if remaining <= 0.0:
+                    break
+                self._viz_overlay_cond.wait(timeout=remaining)
+            return self._viz_overlay_by_frame_id.get(int(frame_id))
 
     def image_callback(self):
         depth, segmentation, rgb, segmentation_response = self.get_sensor_images()
         now = time.time()
+        depth_updated = False
+        frame_id = None
+
+        with self._sensor_cond:
+            if depth is not None:
+                self.last_depth = depth
+                self.last_depth_timestamp = now
+                self.last_depth_frame_id += 1
+                frame_id = int(self.last_depth_frame_id)
+                depth_updated = True
+                if self.debug_print and (self.last_depth_frame_id % self.debug_print_every == 0):
+                    if self._depth_fps_last_time is not None:
+                        dt = float(now - self._depth_fps_last_time)
+                        frames = int(self.last_depth_frame_id - self._depth_fps_last_frame_id)
+                        if dt > 1e-6 and frames > 0:
+                            fps = frames / dt
+                            print("[sensor]", "depth_fps=", round(fps, 2), "frame_id=", self.last_depth_frame_id)
+                    self._depth_fps_last_time = float(now)
+                    self._depth_fps_last_frame_id = int(self.last_depth_frame_id)
+            if rgb is not None:
+                self.last_rgb = rgb
+            else:
+                self.last_rgb = None
+            if segmentation is not None:
+                self.last_segmentation = segmentation
+                self.last_segmentation_response = segmentation_response
+                self.last_segmentation_mask = self.build_segmentation_mask(segmentation)
+                self.last_segmentation_timestamp = now
+            else:
+                self.last_segmentation = None
+                self.last_segmentation_response = None
+                self.last_segmentation_mask = None
+
+            if depth_updated:
+                self._sensor_cond.notify_all() #wakes up all threads currently blocked in cond.wait() on the same Condition. 
+
+        # Visualization uses the local copies from this callback (not shared state).
+        if frame_id is None:
+            frame_id = int(self.last_depth_frame_id)
+        if self.sync_viz_to_control:
+            self._viz_overlay_active = self._get_viz_overlay(frame_id, wait=True)
+        else:
+            self._viz_overlay_active = self._get_viz_overlay(frame_id, wait=False)
         if depth is not None:
-            self.last_depth = depth
-            self.last_depth_timestamp = now
-            self.last_depth_frame_id += 1
             if self.viz_depth_raw:
                 self.visualize_depth_raw(depth)
             if self.viz_depth:
                 depth_input = self.preprocess_depth(depth)
                 self.visualize_depth_input(depth_input)
         if rgb is not None:
-            self.last_rgb = rgb
             if self.viz_rgb and cv2 is not None:
-                cv2.imshow("rgb", rgb)
+                rgb_viz = rgb
+                if hasattr(self, "swap_rb") and getattr(self, "swap_rb"):
+                    # Internally some racers keep RGB for model inputs; OpenCV expects BGR for display.
+                    rgb_viz = rgb_viz[..., ::-1]
+                rgb_viz = self.augment_rgb_viz(rgb_viz)
+                cv2.imshow("rgb", rgb_viz)
                 cv2.waitKey(1)
-        else:
-            self.last_rgb = None
+        self._viz_overlay_active = None
+
         if segmentation is not None:
-            self.last_segmentation = segmentation
-            self.last_segmentation_response = segmentation_response
-            self.last_segmentation_mask = self.build_segmentation_mask(segmentation)
-            self.last_segmentation_timestamp = now
             did_show_segmentation = False
             if self.viz_segmentation_map and cv2 is not None:
                 seg_viz = cv2.cvtColor(segmentation, cv2.COLOR_RGB2BGR)
@@ -935,16 +1021,14 @@ class DiffSimRacer:
                     "segmentation_map", self.segmentation_map_mouse_callback
                 )
                 did_show_segmentation = True
-            if self.viz_gate_mask and cv2 is not None and self.last_segmentation_mask is not None:
-                mask_viz = (self.last_segmentation_mask.astype(np.uint8) * 255)
-                cv2.imshow("gate_mask", mask_viz)
-                did_show_segmentation = True
+            if self.viz_gate_mask and cv2 is not None:
+                mask = self.build_segmentation_mask(segmentation)
+                if mask is not None:
+                    mask_viz = (mask.astype(np.uint8) * 255)
+                    cv2.imshow("gate_mask", mask_viz)
+                    did_show_segmentation = True
             if did_show_segmentation:
                 cv2.waitKey(1)
-        else:
-            self.last_segmentation = None
-            self.last_segmentation_response = None
-            self.last_segmentation_mask = None
 
     def segmentation_map_mouse_callback(self, event, x, y, flags, param):
         if cv2 is None:
@@ -969,6 +1053,15 @@ class DiffSimRacer:
             "rgb=",
             [int(v) for v in rgb.tolist()],
         )
+
+    def augment_rgb_viz(self, rgb_viz):
+        return rgb_viz
+
+    def augment_depth_raw_viz(self, depth_viz):
+        return depth_viz
+
+    def augment_depth_input_viz(self, depth_viz):
+        return depth_viz
 
     def fetch_state(self):
         drone_state = self.airsim_client_odom.getMultirotorState(
@@ -1154,17 +1247,37 @@ class DiffSimRacer:
         return float(roll), float(pitch), float(yaw), throttle, thrust_mag
 
     def control_callback(self):
-        self.current_state = self.fetch_state()
         if self.model is None:
             return
-        if self.last_depth is None:
+
+        depth = None
+        depth_frame_id = -1
+        if self.sync_control_to_depth:
+            deadline = time.time() + max(0.0, self.sync_depth_timeout_sec)
+            with self._sensor_cond:
+                while True:
+                    if self.last_depth is not None and self.last_depth_frame_id != self.last_control_depth_frame_id:
+                        break
+                    remaining = deadline - time.time()
+                    if remaining <= 0.0:
+                        break
+                    self._sensor_cond.wait(timeout=remaining)
+                depth = self.last_depth
+                depth_frame_id = self.last_depth_frame_id
+        else:
+            depth = self.last_depth
+            depth_frame_id = self.last_depth_frame_id
+
+        self.current_state = self.fetch_state()
+
+        if depth is None:
             if self.debug_print and (self.debug_counter % self.debug_print_every == 0):
                 print("[debug]", "target_src=", "depth_missing", "fallback=", "hover")
             self.debug_counter += 1
             self.airsim_client.hoverAsync(vehicle_name=self.drone_name)
             return
-        depth_frame_id = self.last_depth_frame_id
-        if depth_frame_id == self.last_control_depth_frame_id:
+
+        if (not self.sync_control_to_depth) and depth_frame_id == self.last_control_depth_frame_id:
             if self.debug_print and (self.debug_counter % self.debug_print_every == 0):
                 print(
                     "[debug]",
@@ -1177,11 +1290,15 @@ class DiffSimRacer:
                 )
         try:
             accel_world, target_v, aux = self.infer_acceleration(
-                self.last_depth, self.current_state
+                depth, self.current_state
             )
+            overlay = self.build_viz_overlay(aux, int(depth_frame_id))
+            if overlay is not None:
+                self._put_viz_overlay(int(depth_frame_id), overlay)
             current_velocity = self.current_state["linear_velocity"]
             seg_center = aux.get("segmentation_center_px")
             seg_depth = aux.get("segmentation_depth_m")
+            seg_depth_source = aux.get("segmentation_depth_source")
             seg_blob_count = aux.get("segmentation_blob_count")
             seg_blob_depth = aux.get("segmentation_blob_depth_m")
             seg_blob_selection = aux.get("segmentation_blob_selection")
@@ -1232,6 +1349,7 @@ class DiffSimRacer:
                         "v_cur=", np.round(current_velocity, 3),
                         "seg_center=", None if seg_center is None else np.round(seg_center, 1),
                         "seg_depth=", seg_depth_display,
+                        "seg_depth_src=", seg_depth_source,
                         "seg_selected_depth=", seg_selected_depth_display,
                         "seg_blob_depth=", seg_blob_depth_display,
                         "seg_blob_selection=", seg_blob_selection,
@@ -1273,6 +1391,7 @@ class DiffSimRacer:
                         "v_cur=", np.round(current_velocity, 3),
                         "seg_center=", None if seg_center is None else np.round(seg_center, 1),
                         "seg_depth=", seg_depth_display,
+                        "seg_depth_src=", seg_depth_source,
                         "seg_selected_depth=", seg_selected_depth_display,
                         "seg_blob_depth=", seg_blob_depth_display,
                         "seg_blob_selection=", seg_blob_selection,
@@ -1309,7 +1428,8 @@ class DiffSimRacer:
     def repeat_timer_control_callback(self, task, period):
         while self.is_control_thread_active:
             task()
-            time.sleep(period)
+            if not self.sync_control_to_depth:
+                time.sleep(period)
 
     def start_threads(self):
         if not self.is_image_thread_active:
@@ -1367,6 +1487,8 @@ def main():
     parser.add_argument("--hover_throttle", type=float, default=0.9)
     parser.add_argument("--control_period", type=float, default=0.05)
     parser.add_argument("--image_period", type=float, default=0.05)
+    parser.add_argument("--sync_control_to_depth", action="store_true", default=False)
+    parser.add_argument("--sync_depth_timeout_sec", type=float, default=0.5)
     parser.add_argument(
         "--model_path",
         type=str,
@@ -1444,6 +1566,8 @@ def main():
         control_mode=args.control_mode,
         control_period=args.control_period,
         image_period=args.image_period,
+        sync_control_to_depth=args.sync_control_to_depth,
+        sync_depth_timeout_sec=args.sync_depth_timeout_sec,
         hover_throttle=args.hover_throttle,
         target_speed=args.target_speed,
         model_path=args.model_path,

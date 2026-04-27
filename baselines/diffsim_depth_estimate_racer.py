@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 from pathlib import Path
+import os
 import sys
 import time
+import site
+import ctypes
 
 import airsimdroneracinglab as airsim
 import numpy as np
@@ -100,7 +103,7 @@ def _resize_depth_image(depth, target_width, target_height):
 
 
 def _fit_image_to_size(image: np.ndarray, target_width: int, target_height: int) -> tuple[np.ndarray, str]:
-    """Center-crop or zero-pad an image to the requested size."""
+    """Center-crop or edge-pad an image to the requested size."""
     src_height, src_width = image.shape[:2]
     out = image
     actions: list[str] = []
@@ -122,11 +125,11 @@ def _fit_image_to_size(image: np.ndarray, target_width: int, target_height: int)
         pad_bottom = pad_height - pad_top
         pad_left = pad_width // 2
         pad_right = pad_width - pad_left
+        # Replicate edge pixels instead of zero padding to avoid introducing artificial borders.
         out = np.pad(
             out,
             ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
-            mode="constant",
-            constant_values=0,
+            mode="edge",
         )
         pad_parts = []
         if pad_width > 0:
@@ -173,12 +176,72 @@ class DepthAnythingOnnxEstimator:
         self.session = None
         self.net = None
 
+        def _ensure_cuda_shared_libs_visible() -> None:
+            lib_dirs: list[str] = []
+            candidates = []
+            try:
+                candidates.extend(site.getsitepackages() or [])
+            except Exception:
+                pass
+            try:
+                user_sp = site.getusersitepackages()
+                if user_sp:
+                    candidates.append(user_sp)
+            except Exception:
+                pass
+
+            for sp in candidates:
+                if not sp:
+                    continue
+                nvidia_root = Path(sp) / "nvidia"
+                if not nvidia_root.exists():
+                    continue
+                for lib_dir in nvidia_root.glob("*/lib"):
+                    if lib_dir.is_dir():
+                        lib_dirs.append(str(lib_dir))
+
+            if not lib_dirs:
+                return
+
+            existing = os.environ.get("LD_LIBRARY_PATH", "")
+            parts = [p for p in existing.split(":") if p]
+            for lib_dir in reversed(lib_dirs):
+                if lib_dir not in parts:
+                    parts.insert(0, lib_dir)
+            os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+            # Best-effort preload of common CUDA deps so subsequent dlopen succeeds.
+            for soname in (
+                "libcublasLt.so.12",
+                "libcublas.so.12",
+                "libcufft.so.11",
+                "libcurand.so.10",
+                "libcusolver.so.11",
+                "libcusparse.so.12",
+                "libcudnn.so.9",
+                "libcudart.so.12",
+            ):
+                for lib_dir in lib_dirs:
+                    candidate = Path(lib_dir) / soname
+                    if candidate.exists():
+                        try:
+                            ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                        except OSError:
+                            pass
+                        break
+
         if ort is not None:
             available_providers = ort.get_available_providers()
             providers = ["CPUExecutionProvider"]
             if self.device in {"auto", "cuda", "gpu"} and "CUDAExecutionProvider" in available_providers:
+                _ensure_cuda_shared_libs_visible()
                 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            self.session = ort.InferenceSession(str(self.onnx_path), providers=providers)
+            try:
+                self.session = ort.InferenceSession(str(self.onnx_path), providers=providers)
+            except Exception:
+                # Fallback: keep the process running even if CUDA deps are missing.
+                providers = ["CPUExecutionProvider"]
+                self.session = ort.InferenceSession(str(self.onnx_path), providers=providers)
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             self.runtime = "onnxruntime"
@@ -198,10 +261,6 @@ class DepthAnythingOnnxEstimator:
 
         rgb = np.asarray(rgb_image)
         fitted_rgb, action = _fit_image_to_size(rgb, self.input_width, self.input_height)
-        print(
-            f"[depth_input] src={rgb.shape[1]}x{rgb.shape[0]} "
-            f"target={self.input_width}x{self.input_height} action={action}"
-        )
         rgb = fitted_rgb.astype(np.float32, copy=False) / 255.0
         rgb = (rgb - self.input_mean) / self.input_std
         rgb = np.transpose(rgb, (2, 0, 1))[None, ...]
