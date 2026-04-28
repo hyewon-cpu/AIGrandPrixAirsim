@@ -3,7 +3,6 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from datetime import datetime
 import time
-import queue
 import sys
 import threading
 from pathlib import Path
@@ -58,23 +57,22 @@ class BaselineTier1Collector(BaselineRacer):
         viz_traj=False,
         image_period=0.03,
         camera_name="fpv_cam",
-        queue_size=256,
+        max_samples: int | None = None,
     ):
         self.output_root = Path(output_root).expanduser().resolve()
         self.image_period = float(image_period)
         self.camera_name = camera_name
-        self.sample_queue = queue.Queue(maxsize=int(queue_size))
-        self.writer_stop = threading.Event()
-        self.writer_thread = None
-        self.collecting = False
         self.sample_index = 0
         self.samples_saved = 0
-        self.samples_dropped = 0
+        self.max_samples = None if max_samples in (None, 0) else int(max_samples)
         self.last_image_callback_time = None
         self.run_dir = None
         self.rgb_dir = None
         self.depth_dir = None
         self.pairs_path = None
+        self.pairs_fh = None
+        self.capture_active = False
+        self.capture_lock = threading.Lock()
 
         super().__init__(
             drone_name=drone_name,
@@ -92,6 +90,7 @@ class BaselineTier1Collector(BaselineRacer):
             args=(self.image_callback, self.image_period),
             daemon=True,
         )
+
     def repeat_timer_image_callback(self, task, period):
         """Run image callback on a fixed-rate schedule based on wall-clock time."""
         period = float(period)
@@ -136,11 +135,10 @@ class BaselineTier1Collector(BaselineRacer):
 
         self._sync_sample_index_with_existing_files()
         self._recreate_callback_threads()
-        self.writer_stop.clear()
-        self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
-        self.writer_thread.start()
+        self.capture_active = True
+        if self.pairs_fh is None:
+            self.pairs_fh = open(self.pairs_path, "a", encoding="utf-8")
         self.start_image_callback_thread()
-        self.collecting = True
 
     def _sync_sample_index_with_existing_files(self):
         """Continue numbering from existing files to avoid overwriting."""
@@ -173,41 +171,12 @@ class BaselineTier1Collector(BaselineRacer):
             self.sample_index = max_index + 1
 
     def stop_collection(self):
-        if not self.collecting:
-            return
-
+        self.capture_active = False
         self.stop_image_callback_thread()
-        self.writer_stop.set()
-        if self.writer_thread is not None:
-            self.sample_queue.join()
-            self.writer_thread.join()
-        self.collecting = False
-
-    def _enqueue_sample(self, sample):
-        try:
-            self.sample_queue.put_nowait(sample)
-        except queue.Full:
-            self.samples_dropped += 1
-            if self.samples_dropped % 20 == 1:
-                print(
-                    f"WARNING: sample queue is full; dropped {self.samples_dropped} frames so far."
-                )
-
-    def _writer_loop(self):
-        with open(self.pairs_path, "a", encoding="utf-8") as pairs_file:
-            while not self.writer_stop.is_set() or not self.sample_queue.empty():
-                try:
-                    sample = self.sample_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                try:
-                    self._write_sample(sample, pairs_file)
-                    self.samples_saved += 1
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to save sample {sample.get('sample_index')}: {exc}")
-                finally:
-                    self.sample_queue.task_done()
+        if self.pairs_fh is not None:
+            self.pairs_fh.flush()
+            self.pairs_fh.close()
+            self.pairs_fh = None
 
     def _write_sample(self, sample, pairs_file):
         sample_index = int(sample["sample_index"])
@@ -228,63 +197,76 @@ class BaselineTier1Collector(BaselineRacer):
         pairs_file.flush()
 
     def image_callback(self):
-        try:
-            now = time.perf_counter()
-            dt = None if self.last_image_callback_time is None else (now - self.last_image_callback_time)
-            self.last_image_callback_time = now
-            responses = self.airsim_client_images.simGetImages(
-                [
-                    airsim.ImageRequest(
-                        self.camera_name,
-                        airsim.ImageType.Scene,
-                        pixels_as_float=False,
-                        compress=False,
-                    ),
-                    airsim.ImageRequest(
-                        self.camera_name,
-                        airsim.ImageType.DepthPerspective,
-                        pixels_as_float=True,
-                        compress=False,
-                    ),
-                ],
-                vehicle_name=self.drone_name,
-            )
-            if len(responses) < 2:
+        if not self.capture_active:
+            return
+
+        with self.capture_lock:
+            if self.max_samples is not None and self.samples_saved >= self.max_samples:
+                self.capture_active = False
+                return
+            if self.pairs_fh is None:
                 return
 
-            rgb_response = responses[0]
-            depth_response = responses[1]
-            if (
-                rgb_response.width <= 0
-                or rgb_response.height <= 0
-                or depth_response.width <= 0
-                or depth_response.height <= 0
-            ):
-                return
+            try:
+                now = time.perf_counter()
+                dt = None if self.last_image_callback_time is None else (now - self.last_image_callback_time)
+                self.last_image_callback_time = now
 
-            rgb = np.frombuffer(rgb_response.image_data_uint8, dtype=np.uint8).copy()
-            rgb = rgb.reshape(rgb_response.height, rgb_response.width, 3)
+                responses = self.airsim_client_images.simGetImages(
+                    [
+                        airsim.ImageRequest(
+                            self.camera_name,
+                            airsim.ImageType.Scene,
+                            pixels_as_float=False,
+                            compress=False,
+                        ),
+                        airsim.ImageRequest(
+                            self.camera_name,
+                            airsim.ImageType.DepthPerspective,
+                            pixels_as_float=True,
+                            compress=False,
+                        ),
+                    ],
+                    vehicle_name=self.drone_name,
+                )
+                if len(responses) < 2:
+                    return
 
-            depth = np.array(depth_response.image_data_float, dtype=np.float32)
-            depth = depth.reshape(depth_response.height, depth_response.width)
+                rgb_response = responses[0]
+                depth_response = responses[1]
+                if (
+                    rgb_response.width <= 0
+                    or rgb_response.height <= 0
+                    or depth_response.width <= 0
+                    or depth_response.height <= 0
+                ):
+                    return
 
-            sample = {
-                "sample_index": self.sample_index,
-                "rgb": rgb,
-                "depth": depth,
-            }
-            self.sample_index += 1
-            self._enqueue_sample(sample)
-            if self.sample_index % 100 == 0:
-                if dt is None or dt <= 0.0:
-                    print(f"[collector] samples={self.sample_index}")
-                else:
-                    print(
-                        f"[collector] samples={self.sample_index} "
-                        f"callback_dt={dt:.3f}s (~{1.0/dt:.1f} Hz)"
-                    )
-        except Exception as exc:  # pragma: no cover
-            print("image_callback failed:", exc)
+                rgb = np.frombuffer(rgb_response.image_data_uint8, dtype=np.uint8).copy()
+                rgb = rgb.reshape(rgb_response.height, rgb_response.width, 3)
+
+                depth = np.array(depth_response.image_data_float, dtype=np.float32)
+                depth = depth.reshape(depth_response.height, depth_response.width)
+
+                sample = {
+                    "sample_index": self.sample_index,
+                    "rgb": rgb,
+                    "depth": depth,
+                }
+                self._write_sample(sample, self.pairs_fh)
+                self.samples_saved += 1
+                self.sample_index += 1
+
+                if self.samples_saved % 100 == 0:
+                    if dt is None or dt <= 0.0:
+                        print(f"[collector] samples={self.samples_saved}")
+                    else:
+                        print(
+                            f"[collector] samples={self.samples_saved} "
+                            f"callback_dt={dt:.3f}s (~{1.0/dt:.1f} Hz)"
+                        )
+            except Exception as exc:  # pragma: no cover
+                print("image_callback failed:", exc)
 
 
 def build_args():
@@ -317,6 +299,9 @@ def build_args():
     parser.add_argument("--num_games",type=int, default=100,
         help="Number of races to run sequentially for data collection.",
     )
+    parser.add_argument("--max_samples", type=int,default=4000,
+        help="Stop after saving this many samples total across all games. 0 disables the limit.",
+    )
     parser.add_argument("--camera_name", type=str, default="fpv_cam")
     parser.add_argument("--image_period", type=float, default=0.03)
     parser.add_argument("--takeoff_height", type=float, default=1.0)
@@ -345,6 +330,8 @@ def main():
     args = build_args()
     if args.num_games < 1:
         raise ValueError(f"--num_games must be >= 1, got {args.num_games}")
+    if args.max_samples < 0:
+        raise ValueError(f"--max_samples must be >= 0, got {args.max_samples}")
 
     # Match the baseline script's tier handling for qualifier levels.
     if args.level_name == "Qualifier_Tier_1":
@@ -360,6 +347,7 @@ def main():
         viz_traj=args.viz_traj,
         image_period=args.image_period,
         camera_name=args.camera_name,
+        max_samples=args.max_samples,
     )
 
     try:
@@ -371,12 +359,18 @@ def main():
         )
 
         for game_index in range(args.num_games):
+            if args.max_samples and collector.samples_saved >= args.max_samples:
+                print(
+                    f"Reached --max_samples={args.max_samples}; stopping data collection."
+                )
+                break
             print(f"Starting game {game_index + 1}/{args.num_games}")
             game_start_sample_index = collector.sample_index
             game_start_saved = collector.samples_saved
-            game_start_dropped = collector.samples_dropped
 
-            collector.load_level(args.level_name)
+            # Match `annotate_gate_corners.py`: load the level once, then just reset/start.
+            if game_index == 0:
+                collector.load_level(args.level_name)
             collector.start_race(args.race_tier)
             collector.initialize_drone()
             collector.takeoff_with_moveOnSpline(takeoff_height=args.takeoff_height)
@@ -394,6 +388,7 @@ def main():
                         flight = collector.fly_through_all_gates_one_by_one_with_moveOnSpline()
                     else:
                         flight = collector.fly_through_all_gates_one_by_one_with_moveOnSplineVelConstraints()
+
                 flight.join()
             finally:
                 try:
@@ -404,14 +399,18 @@ def main():
                     collector.reset_race()
                 except Exception as exc:  # pragma: no cover
                     print(f"Failed to reset race cleanly: {exc}")
+                if args.max_samples and collector.samples_saved >= args.max_samples:
+                    print(
+                        f"Reached --max_samples={args.max_samples}; stopping data collection."
+                    )
+                    break
 
                 if collector.run_dir is not None:
                     game_saved = collector.samples_saved - game_start_saved
-                    game_dropped = collector.samples_dropped - game_start_dropped
                     game_samples = collector.sample_index - game_start_sample_index
                     print(
                         f"Game {game_index + 1}/{args.num_games}: "
-                        f"new_samples={game_samples}, saved={game_saved}, dropped={game_dropped}. "
+                        f"new_samples={game_samples}, saved={game_saved}. "
                         f"total_saved={collector.samples_saved} to {collector.run_dir}"
                     )
     except KeyboardInterrupt:

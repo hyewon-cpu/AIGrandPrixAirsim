@@ -322,25 +322,15 @@ class DiffSimRacer:
             vehicle_name=self.drone_name
         ).position #current position at that moment 
 
-        if not self.gate_poses_ground_truth:
-            try:
-                self.get_ground_truth_gate_poses()
-            except Exception:
-                pass
-        if self.debug_print:
-            print(
-                "[takeoff]",
-                "gate_poses_loaded=",
-                bool(self.gate_poses_ground_truth),
-                "gate_count=",
-                0 if not self.gate_poses_ground_truth else len(self.gate_poses_ground_truth),
-            )
+      
+        print("[takeoff] starting")
         takeoff_waypoint = airsim.Vector3r(
             start_position.x_val,
             start_position.y_val,
             start_position.z_val - takeoff_height,
         )
         waypoints = [takeoff_waypoint]
+        print("[takeoff] waypoints set")
 
         self.airsim_client.moveOnSplineAsync(
             waypoints,
@@ -351,6 +341,59 @@ class DiffSimRacer:
             add_acceleration_constraint=False,
             vehicle_name=self.drone_name,
         ).join()
+        print("[takeoff] called moveonspline")
+
+        # `moveOnSplineAsync(...).join()` returns when the RPC call completes, not when the
+        # drone physically reaches the waypoint. If we start sending other commands right
+        # away, AirSim cancels the spline task. Wait briefly for altitude to settle.
+        try:
+            desired_z = float(start_position.z_val - takeoff_height)
+            timeout_sec = 100.0
+            tol_m = 0.15
+            t_end = time.time() + timeout_sec
+            while time.time() < t_end:
+                pose = self.airsim_client.simGetVehiclePose(vehicle_name=self.drone_name)
+                z_now = float(pose.position.z_val)
+                if abs(z_now - desired_z) <= tol_m:
+                    break
+                time.sleep(0.05)
+        except Exception:
+            pass
+
+        self.align()
+
+
+    def align(self):
+        # Align yaw toward the active gate (baseline moveOnSpline allocates yaw along
+        # the trajectory tangent, so drone_2 typically ends up facing the first gate
+        # before/while starting to move). Our learned controller may start from an
+        # arbitrary spawn yaw, so do a one-time yaw alignment after takeoff.
+        if self.gate_poses_ground_truth:
+            print("[align] aligning started")
+            try:
+                current_position = self.airsim_client.simGetVehiclePose(
+                    vehicle_name=self.drone_name
+                ).position
+                pos = np.array(
+                    [current_position.x_val, current_position.y_val, current_position.z_val],
+                    dtype=np.float32,
+                )
+                target = self.ground_truth_gate_target_point_airsim(pos)
+                if target is not None:
+                    delta_xy = target[:2] - pos[:2]
+                    if float(np.linalg.norm(delta_xy)) > 1e-3:
+                        yaw_deg = math.degrees(math.atan2(float(delta_xy[1]), float(delta_xy[0])))
+                        self.airsim_client.moveToYawAsync(
+                            yaw_deg, vehicle_name=self.drone_name
+                        ).join()
+            except Exception:
+                # Best-effort; yaw alignment shouldn't block takeoff.
+                print("[align]could not align")
+                pass
+        else: 
+            print("[align] no gate_poses_ground truth")
+    
+    
 
     def get_ground_truth_gate_poses(self):
         gate_names_sorted_bad = sorted(self.airsim_client.simListSceneObjects("Gate.*"))
@@ -913,7 +956,7 @@ class DiffSimRacer:
         depth = np.clip(depth, 0.0, 50.0)
         depth_map = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
         depth_map = depth_map.astype(np.uint8)
-        depth_map = self.augment_depth_raw_viz(depth_map)
+        #depth_map = self.augment_depth_raw_viz(depth_map)
         cv2.imshow("depth_raw", depth_map)
         cv2.waitKey(1)
 
